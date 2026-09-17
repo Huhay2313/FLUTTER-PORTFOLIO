@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
@@ -68,7 +68,7 @@ class _Activity2ScreenState extends State<Activity2Screen> {
         elevation: 0,
         scrolledUnderElevation: 0,
         title: Text(
-          'Activity 2 — Checklist',
+          'Activity 1.5 — Checklist',
           style: GoogleFonts.inter(
             fontWeight: FontWeight.w800,
             fontSize: 18,

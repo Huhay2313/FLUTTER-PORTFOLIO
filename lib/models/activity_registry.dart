@@ -1,7 +1,8 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import '../screens/activity1_screen.dart';
 import '../screens/activity2_screen.dart';
+import '../screens/activity2_network_screen.dart';
 import 'activity_meta.dart';
 
 // Single registry file for all lab activities across the semester.
@@ -17,12 +18,21 @@ final List<ActivityMeta> labActivities = [
     builder: (context) => const Activity1Screen(),
   ),
   ActivityMeta(
-    id: 'activity_2',
-    title: 'Activity 2',
+    id: 'activity_1_5',
+    title: 'Activity 1.5',
     subtitle: 'Task Checklist • Daily activity tracker',
     icon: Icons.checklist_rounded,
     color: AppPalette.accent,
     colorSoft: AppPalette.accentSoft,
     builder: (context) => const Activity2Screen(),
+  ),
+  ActivityMeta(
+    id: 'activity_2',
+    title: 'Activity 2',
+    subtitle: 'Network Monitor • Real-time connectivity & request queuing',
+    icon: Icons.wifi_tethering_rounded,
+    color: AppPalette.primary,
+    colorSoft: AppPalette.primarySoft,
+    builder: (context) => const Activity2NetworkScreen(),
   ),
 ];
