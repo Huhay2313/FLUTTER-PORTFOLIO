@@ -1,50 +1,51 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:http/http.dart' as http;
 import '../theme/app_theme.dart';
 import '../widgets/motion.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Activity 2 — Network Monitor
+// Activity 2 — Network Monitor & Resilient Request Queue
 //
 // Features:
-//   1. Real-time Network Stream Listener (Wi-Fi, Cellular, Offline, Ethernet)
-//   2. Handover Detection (Wi-Fi <-> Cellular) with event logging
-//   3. Continuous / Long-running Network Request (Fetching 5,000 JSON records)
-//   4. Request Queuing System (Catches SocketException/drop without crashing)
-//   5. Graceful Recovery (Auto-retries queued requests via connection stream)
+//   1. Real-time Network Stream Listener (Wi-Fi, Cellular, Offline)
+//   2. FIFO Request Queue — Queues requests when multiple are triggered or offline
+//   3. Mid-Flight Interruption Recovery — Preserves interrupted requests and re-queues
+//   4. Graceful Recovery — Automatically drains queue upon network restoration
+//   5. Live Visual Feedback — Progress indicator, queue counter, state badges
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum NetworkType { wifi, cellular, ethernet, offline }
+enum _NetStatus { wifi, cellular, offline }
 
-enum RequestStatus { queued, running, completed, failed }
+enum RequestState { queued, running, interrupted, done }
 
-class NetworkRequestItem {
-  final String id;
-  final String title;
-  final String url;
-  final DateTime queuedAt;
-  RequestStatus status;
-  String? failureReason;
-  int recordsFetched;
+class QueuedRequest {
+  final int id;
+  final String label;
+  final DateTime createdAt;
+  RequestState state;
+  int currentChunk;
+  final int totalChunks;
+  String detail;
   int retryCount;
 
-  NetworkRequestItem({
+  QueuedRequest({
     required this.id,
-    required this.title,
-    required this.url,
-    required this.queuedAt,
-    this.status = RequestStatus.queued,
-    this.failureReason,
-    this.recordsFetched = 0,
+    required this.label,
+    required this.createdAt,
+    this.state = RequestState.queued,
+    this.currentChunk = 0,
+    this.totalChunks = 10,
+    this.detail = 'Waiting in queue',
     this.retryCount = 0,
   });
+
+  double get progress => (currentChunk / totalChunks).clamp(0.0, 1.0);
+  int get progressPercent => (progress * 100).toInt();
 }
 
 class Activity2NetworkScreen extends StatefulWidget {
@@ -57,29 +58,21 @@ class Activity2NetworkScreen extends StatefulWidget {
 class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
     with SingleTickerProviderStateMixin {
   // ── Network State ────────────────────────────────────────────────────────
-  NetworkType _currentNetwork = NetworkType.offline;
+  _NetStatus _netStatus = _NetStatus.offline;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
-  int _handoverCount = 0;
-  DateTime? _lastStateChange;
+  DateTime? _lastChangedAt;
+  bool _isManualDrop = false;
 
-  // ── Pulsing Animation for Live Indicator ────────────────────────────────
+  // ── Pulse animation for Live status ──────────────────────────────────────
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
 
-  // ── Request Queue & State ───────────────────────────────────────────────
-  final Queue<NetworkRequestItem> _requestQueue = Queue<NetworkRequestItem>();
-  final List<NetworkRequestItem> _historyLog = [];
-  final List<String> _eventLogs = [];
-  bool _isProcessingQueue = false;
+  // ── Request Queue Management ─────────────────────────────────────────────
+  final Queue<QueuedRequest> _pendingQueue = Queue<QueuedRequest>();
+  final List<QueuedRequest> _allRequests = [];
+  QueuedRequest? _activeRequest;
+  bool _isQueueWorkerRunning = false;
   int _requestCounter = 1;
-  int _totalRecordsDownloaded = 0;
-
-  // ── Active Fetch Progress ───────────────────────────────────────────────
-  bool _isFetching = false;
-  String _activeTaskLabel = '';
-  double _progressValue = 0.0;
-  int _streamedBytes = 0;
-  int _streamedRecords = 0;
 
   @override
   void initState() {
@@ -108,332 +101,274 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
   Future<void> _initConnectivity() async {
     try {
       final initialResults = await Connectivity().checkConnectivity();
-      _handleConnectivityUpdate(initialResults, isInitial: true);
-    } catch (e) {
-      _logEvent('Error initializing connectivity: $e');
+      _onConnectivityChanged(initialResults, isInitial: true);
+    } catch (_) {
+      _onConnectivityChanged([ConnectivityResult.none], isInitial: true);
     }
 
     _connectivitySub = Connectivity()
         .onConnectivityChanged
-        .listen((results) => _handleConnectivityUpdate(results));
+        .listen((results) => _onConnectivityChanged(results));
   }
 
-  void _handleConnectivityUpdate(List<ConnectivityResult> results, {bool isInitial = false}) {
-    final result = results.isNotEmpty ? results.first : ConnectivityResult.none;
-    final prev = _currentNetwork;
+  void _onConnectivityChanged(List<ConnectivityResult> results, {bool isInitial = false}) {
+    if (_isManualDrop) return; // Respect manual simulation if active
 
-    NetworkType updated;
+    final result = results.isNotEmpty ? results.first : ConnectivityResult.none;
+    final previous = _netStatus;
+    _NetStatus next;
+
     switch (result) {
       case ConnectivityResult.wifi:
-        updated = NetworkType.wifi;
+        next = _NetStatus.wifi;
         break;
       case ConnectivityResult.mobile:
-        updated = NetworkType.cellular;
-        break;
-      case ConnectivityResult.ethernet:
-        updated = NetworkType.ethernet;
+        next = _NetStatus.cellular;
         break;
       default:
-        updated = NetworkType.offline;
+        next = _NetStatus.offline;
     }
 
     if (!mounted) return;
 
-    final isHandover = !isInitial &&
-        prev != updated &&
-        prev != NetworkType.offline &&
-        updated != NetworkType.offline;
-
-    final isReconnection = !isInitial &&
-        prev == NetworkType.offline &&
-        updated != NetworkType.offline;
-
-    final isDisconnection = !isInitial &&
-        prev != NetworkType.offline &&
-        updated == NetworkType.offline;
-
     setState(() {
-      _currentNetwork = updated;
-      _lastStateChange = DateTime.now();
-      if (isHandover) {
-        _handoverCount++;
-      }
+      _netStatus = next;
+      _lastChangedAt = DateTime.now();
     });
 
-    // Logging & Haptic
-    if (isHandover) {
-      HapticFeedback.mediumImpact();
-      _logEvent('Handover detected: ${_netName(prev)} ➔ ${_netName(updated)}');
-      showAppSnackbar(
-        context,
-        message: 'Network handover to ${_netName(updated)} (Active)',
-        icon: Icons.swap_horiz_rounded,
-      );
-    } else if (isDisconnection) {
+    if (isInitial) return;
+
+    // Handover or Drop detection
+    if (next == _NetStatus.offline && previous != _NetStatus.offline) {
       HapticFeedback.heavyImpact();
-      _logEvent('Connection lost. Entering Offline mode.');
       showAppSnackbar(
         context,
-        message: 'Network lost — pending requests will be queued',
+        message: 'Connection dropped — active requests will be preserved in queue',
         icon: Icons.wifi_off_rounded,
         isDestructive: true,
       );
-    } else if (isReconnection) {
-      HapticFeedback.lightImpact();
-      _logEvent('Connection restored via ${_netName(updated)}. Triggering recovery...');
+    } else if (previous == _NetStatus.offline && next != _NetStatus.offline) {
+      HapticFeedback.mediumImpact();
       showAppSnackbar(
         context,
-        message: 'Connected to ${_netName(updated)} — Auto-resuming queue',
+        message: 'Connection restored (${_netStatusName(next)}) — Resuming queue',
         icon: Icons.wifi_rounded,
       );
-      // Auto-drain / resume queued requests
-      _processQueue();
-    } else if (isInitial) {
-      _logEvent('Initial network state: ${_netName(updated)}');
+      // Graceful Recovery: auto-resume the queue
+      _drainQueueWorker();
+    } else if (previous != next && previous != _NetStatus.offline) {
+      HapticFeedback.lightImpact();
+      showAppSnackbar(
+        context,
+        message: 'Handover to ${_netStatusName(next)} — Connection stable',
+        icon: Icons.swap_horiz_rounded,
+      );
     }
   }
 
-  String _netName(NetworkType type) {
-    switch (type) {
-      case NetworkType.wifi:
+  String _netStatusName(_NetStatus status) {
+    switch (status) {
+      case _NetStatus.wifi:
         return 'Wi-Fi';
-      case NetworkType.cellular:
-        return 'Cellular Data';
-      case NetworkType.ethernet:
-        return 'Ethernet';
-      case NetworkType.offline:
+      case _NetStatus.cellular:
+        return 'Cellular';
+      case _NetStatus.offline:
         return 'Offline';
     }
   }
 
-  void _logEvent(String text) {
-    final timeStr = TimeOfDay.now().format(context);
-    setState(() {
-      _eventLogs.insert(0, '[$timeStr] $text');
-      if (_eventLogs.length > 50) {
-        _eventLogs.removeLast();
-      }
-    });
-  }
+  // ── Request Trigger & Queuing ────────────────────────────────────────────
 
-  // ── Real Continuous & Long-Running Dataset Fetching ───────────────────────
-
-  /// Initiates fetching a large dataset (e.g. 5,000 JSON records from JSONPlaceholder)
-  /// or queues it if network is currently unavailable.
-  void triggerLargeDatasetFetch() {
-    final id = 'REQ-${_requestCounter++}';
-    final requestItem = NetworkRequestItem(
+  void _triggerRequest() {
+    HapticFeedback.lightImpact();
+    final id = _requestCounter++;
+    final req = QueuedRequest(
       id: id,
-      title: 'Fetch Photos Dataset (5,000 items)',
-      url: 'https://jsonplaceholder.typicode.com/photos',
-      queuedAt: DateTime.now(),
+      label: 'Request #$id',
+      createdAt: DateTime.now(),
+      state: RequestState.queued,
+      totalChunks: 10,
+      currentChunk: 0,
+      detail: _netStatus == _NetStatus.offline
+          ? 'Queued (Offline — will auto-start when online)'
+          : 'Queued (Waiting for slot)',
     );
 
-    _handleIncomingRequest(requestItem);
-  }
-
-  /// Triggers a multi-batch continuous request (10 sequential batches)
-  void triggerContinuousBatchSync() {
-    final id = 'BATCH-${_requestCounter++}';
-    final requestItem = NetworkRequestItem(
-      id: id,
-      title: 'Continuous Comments Sync (500 records)',
-      url: 'https://jsonplaceholder.typicode.com/comments',
-      queuedAt: DateTime.now(),
-    );
-
-    _handleIncomingRequest(requestItem);
-  }
-
-  void _handleIncomingRequest(NetworkRequestItem item) {
     setState(() {
-      _historyLog.insert(0, item);
+      _allRequests.insert(0, req);
+      _pendingQueue.add(req);
     });
 
-    if (_currentNetwork == NetworkType.offline) {
-      // Offline: Enqueue immediately
-      _enqueueRequest(item, reason: 'Device currently offline');
-    } else {
-      // Online: Execute or queue if already busy
-      if (_isFetching) {
-        _enqueueRequest(item, reason: 'Waiting for active fetch to complete');
-      } else {
-        _executeRequest(item);
-      }
-    }
-  }
-
-  void _enqueueRequest(NetworkRequestItem item, {required String reason}) {
-    setState(() {
-      item.status = RequestStatus.queued;
-      item.failureReason = reason;
-      if (!_requestQueue.contains(item)) {
-        _requestQueue.add(item);
-      }
-    });
-    _logEvent('${item.id} queued: $reason');
     showAppSnackbar(
       context,
-      message: '${item.id} queued — will execute upon stable connection',
-      icon: Icons.hourglass_top_rounded,
+      message: '${req.label} added to queue (${_pendingQueue.length} pending)',
+      icon: Icons.queue_rounded,
     );
+
+    // Try processing if worker is idle
+    _drainQueueWorker();
   }
 
-  /// Executes the long-running network request with robust error handling.
-  /// If connection drops mid-flight (SocketException/ClientException),
-  /// catches the error and queues the request instead of crashing!
-  Future<void> _executeRequest(NetworkRequestItem item) async {
-    if (_currentNetwork == NetworkType.offline) {
-      _enqueueRequest(item, reason: 'Connection dropped before execution');
-      return;
-    }
+  // ── Queue Processing Worker (FIFO) ───────────────────────────────────────
 
-    setState(() {
-      _isFetching = true;
-      _activeTaskLabel = '${item.id}: ${item.title}';
-      _progressValue = 0.05;
-      _streamedBytes = 0;
-      _streamedRecords = 0;
-      item.status = RequestStatus.running;
-      item.failureReason = null;
-    });
+  Future<void> _drainQueueWorker() async {
+    if (_isQueueWorkerRunning) return;
+    if (_netStatus == _NetStatus.offline) return;
+    if (_pendingQueue.isEmpty) return;
 
-    _logEvent('Executing ${item.id} via ${_netName(_currentNetwork)}...');
+    _isQueueWorkerRunning = true;
 
-    final client = http.Client();
+    while (_pendingQueue.isNotEmpty && _netStatus != _NetStatus.offline) {
+      final req = _pendingQueue.first; // Peek first
+      _pendingQueue.removeFirst();     // Pop
 
-    try {
-      final request = http.Request('GET', Uri.parse(item.url));
-      final streamedResponse = await client.send(request).timeout(
-        const Duration(seconds: 20),
-        onTimeout: () {
-          throw TimeoutException('Network request timed out during transfer');
-        },
-      );
+      await _executeRequest(req);
 
-      if (streamedResponse.statusCode != 200) {
-        throw HttpException('HTTP ${streamedResponse.statusCode}');
+      // Small pause between queue items
+      if (_netStatus != _NetStatus.offline && _pendingQueue.isNotEmpty) {
+        await Future.delayed(const Duration(milliseconds: 300));
       }
-
-      final contentLength = streamedResponse.contentLength ?? 1000000;
-      int receivedBytes = 0;
-      final List<int> byteBuffer = [];
-
-      // Stream the large response chunk-by-chunk to simulate continuous streaming
-      await for (final chunk in streamedResponse.stream) {
-        // Handover / connection check mid-flight
-        if (_currentNetwork == NetworkType.offline) {
-          throw const SocketException('Connection lost during stream transfer');
-        }
-
-        byteBuffer.addAll(chunk);
-        receivedBytes += chunk.length;
-
-        if (mounted) {
-          setState(() {
-            _streamedBytes = receivedBytes;
-            _progressValue = (receivedBytes / contentLength).clamp(0.05, 0.95);
-          });
-        }
-
-        // Small micro-yield so UI can animate smoothly
-        await Future.delayed(const Duration(milliseconds: 15));
-      }
-
-      // Parse JSON records
-      final decodedJson = jsonDecode(utf8.decode(byteBuffer));
-      final recordsCount = decodedJson is List ? decodedJson.length : 1;
-
-      if (!mounted) return;
-
-      setState(() {
-        _progressValue = 1.0;
-        _streamedRecords = recordsCount;
-        _totalRecordsDownloaded += recordsCount;
-        item.status = RequestStatus.completed;
-        item.recordsFetched = recordsCount;
-        _isFetching = false;
-      });
-
-      _logEvent('Success! ${item.id} fetched $recordsCount records (${(receivedBytes / 1024).toStringAsFixed(1)} KB)');
-      showAppSnackbar(
-        context,
-        message: '${item.id} complete: $recordsCount records loaded',
-        icon: Icons.check_circle_rounded,
-      );
-    } on SocketException catch (e) {
-      _handleNetworkError(item, 'Socket error: ${e.message}');
-    } on http.ClientException catch (e) {
-      _handleNetworkError(item, 'Client error during handover: ${e.message}');
-    } on TimeoutException catch (e) {
-      _handleNetworkError(item, 'Timeout: ${e.message}');
-    } catch (e) {
-      _handleNetworkError(item, 'Network exception: $e');
-    } finally {
-      client.close();
-      if (mounted) {
-        setState(() {
-          _isFetching = false;
-        });
-      }
-      // Continue queue processing if any remain
-      _processQueue();
-    }
-  }
-
-  void _handleNetworkError(NetworkRequestItem item, String reason) {
-    if (!mounted) return;
-    HapticFeedback.heavyImpact();
-
-    item.retryCount++;
-    _logEvent('Caught network error on ${item.id}: $reason');
-
-    // Queue request for graceful recovery instead of failing or crashing
-    _enqueueRequest(item, reason: reason);
-  }
-
-  /// Graceful Recovery: Drains queued requests automatically when stable connection is established
-  Future<void> _processQueue() async {
-    if (_isProcessingQueue || _isFetching) return;
-    if (_currentNetwork == NetworkType.offline) return;
-    if (_requestQueue.isEmpty) return;
-
-    _isProcessingQueue = true;
-
-    while (_requestQueue.isNotEmpty && _currentNetwork != NetworkType.offline) {
-      final nextItem = _requestQueue.removeFirst();
-      _logEvent('Graceful Recovery: Auto-resuming queued ${nextItem.id}...');
-      await _executeRequest(nextItem);
-
-      // Brief delay between recovery requests
-      await Future.delayed(const Duration(milliseconds: 300));
     }
 
     if (mounted) {
       setState(() {
-        _isProcessingQueue = false;
+        _isQueueWorkerRunning = false;
+        _activeRequest = null;
       });
     }
   }
 
-  // ── Manual simulation triggers for easy testing ──────────────────────────
+  // ── Single Request Execution with Interruption Catching ──────────────────
 
-  void _simulateDrop() {
-    _handleConnectivityUpdate([ConnectivityResult.none]);
+  Future<void> _executeRequest(QueuedRequest req) async {
+    if (_netStatus == _NetStatus.offline) {
+      // Re-queue at the front if offline before starting
+      _requeueInterrupted(req, 'Connection offline before execution');
+      return;
+    }
+
+    setState(() {
+      _activeRequest = req;
+      req.state = RequestState.running;
+      req.detail = req.currentChunk > 0
+          ? 'Resumed from ${req.progressPercent}% (${req.currentChunk}/${req.totalChunks} chunks)'
+          : 'Processing large dataset transfer...';
+    });
+
+    try {
+      // Stream chunks (simulating continuous transfer of a 5,000-record dataset)
+      final startChunk = req.currentChunk;
+      for (int i = startChunk + 1; i <= req.totalChunks; i++) {
+        // Mid-flight connection check (Interruption or Handover drop)
+        if (_netStatus == _NetStatus.offline) {
+          throw const SocketException('Connection interrupted during packet transfer');
+        }
+
+        // Simulate chunk transfer duration (~350ms per chunk, ~3.5s total)
+        await Future.delayed(const Duration(milliseconds: 350));
+
+        if (!mounted) return;
+
+        // Check again after async gap
+        if (_netStatus == _NetStatus.offline) {
+          throw const SocketException('Connection interrupted during packet transfer');
+        }
+
+        setState(() {
+          req.currentChunk = i;
+          req.detail = 'Streaming data: ${req.progressPercent}% (${i * 500} / 5000 records)';
+        });
+      }
+
+      // Completed successfully
+      if (!mounted) return;
+      setState(() {
+        req.state = RequestState.done;
+        req.currentChunk = req.totalChunks;
+        req.detail = 'Completed — 5,000 records loaded';
+      });
+
+      HapticFeedback.lightImpact();
+    } on SocketException catch (e) {
+      _requeueInterrupted(req, e.message);
+    } catch (e) {
+      _requeueInterrupted(req, 'Network error: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          if (_activeRequest == req) {
+            _activeRequest = null;
+          }
+        });
+      }
+    }
   }
 
-  void _simulateWifi() {
-    _handleConnectivityUpdate([ConnectivityResult.wifi]);
+  void _requeueInterrupted(QueuedRequest req, String reason) {
+    if (!mounted) return;
+    HapticFeedback.heavyImpact();
+
+    req.retryCount++;
+    req.state = RequestState.interrupted;
+    req.detail = 'Interrupted at ${req.progressPercent}% — Saved in queue';
+
+    // Put back at the FRONT of the queue so it resumes first!
+    if (!_pendingQueue.contains(req)) {
+      _pendingQueue.addFirst(req);
+    }
+
+    setState(() {
+      _activeRequest = null;
+    });
+
+    showAppSnackbar(
+      context,
+      message: '${req.label} interrupted at ${req.progressPercent}% — Preserved in queue',
+      icon: Icons.pause_circle_filled_rounded,
+      isDestructive: true,
+    );
   }
 
-  void _simulateCellular() {
-    _handleConnectivityUpdate([ConnectivityResult.mobile]);
+  // ── Manual Simulation Controls (for quick demo in recording) ─────────────
+
+  void _toggleManualDrop() {
+    setState(() {
+      _isManualDrop = !_isManualDrop;
+      if (_isManualDrop) {
+        _netStatus = _NetStatus.offline;
+        _lastChangedAt = DateTime.now();
+      } else {
+        // Re-read actual hardware connectivity
+        _initConnectivity();
+      }
+    });
+
+    if (_isManualDrop) {
+      showAppSnackbar(
+        context,
+        message: 'Simulated Network Drop: App is now Offline',
+        icon: Icons.wifi_off_rounded,
+        isDestructive: true,
+      );
+    } else {
+      showAppSnackbar(
+        context,
+        message: 'Simulated Network Restored',
+        icon: Icons.wifi_rounded,
+      );
+    }
   }
 
   // ── Build UI ─────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
+    final timeStr = _lastChangedAt == null
+        ? '12:00:00'
+        : '${_lastChangedAt!.hour.toString().padLeft(2, '0')}:'
+            '${_lastChangedAt!.minute.toString().padLeft(2, '0')}:'
+            '${_lastChangedAt!.second.toString().padLeft(2, '0')}';
+
     return Scaffold(
       backgroundColor: AppPalette.background(context),
       appBar: AppBar(
@@ -449,12 +384,14 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
           ),
         ),
         actions: [
+          // Quick simulation toggle icon in appbar for presentation
           IconButton(
-            tooltip: 'Clear event log',
-            icon: const Icon(Icons.cleaning_services_rounded, size: 20),
-            onPressed: () {
-              setState(() => _eventLogs.clear());
-            },
+            tooltip: _isManualDrop ? 'Restore Connection' : 'Simulate Network Drop',
+            icon: Icon(
+              _isManualDrop ? Icons.wifi_off_rounded : Icons.wifi_tethering_rounded,
+              color: _isManualDrop ? AppPalette.accent : AppPalette.primary,
+            ),
+            onPressed: _toggleManualDrop,
           ),
         ],
         centerTitle: false,
@@ -462,76 +399,146 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         children: [
-          // ── Real-time Dynamic Dashboard Card ──────────────────────────
-          _buildNetworkDashboardCard(),
+          // ── Network Status Card (Wi-Fi / Cellular / Offline) ──────────
+          _buildStatusBanner(),
           const SizedBox(height: 14),
 
-          // ── Metrics Row ───────────────────────────────────────────────
-          _buildMetricsRow(),
-          const SizedBox(height: 14),
+          // ── Info Chips: Last Change & Queued Requests ─────────────────
+          Row(
+            children: [
+              Expanded(
+                child: _buildInfoChip(
+                  icon: Icons.access_time_rounded,
+                  label: 'Last change',
+                  value: timeStr,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildInfoChip(
+                  icon: Icons.queue_rounded,
+                  label: 'Queued',
+                  value: '${_pendingQueue.length} request${_pendingQueue.length == 1 ? '' : 's'}',
+                  highlight: _pendingQueue.isNotEmpty,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
 
-          // ── Simulation Bar (Wi-Fi, Cellular, Drop) ─────────────────────
-          _buildSimulationControls(),
-          const SizedBox(height: 14),
-
-          // ── Fetch Action Buttons ──────────────────────────────────────
-          _buildActionButtons(),
-          const SizedBox(height: 14),
-
-          // ── Live Streamed Transfer Progress ───────────────────────────
-          if (_isFetching) ...[
-            _buildActiveFetchCard(),
-            const SizedBox(height: 14),
+          // ── Active Request Progress Banner ────────────────────────────
+          if (_activeRequest != null) ...[
+            _buildActiveTransferCard(_activeRequest!),
+            const SizedBox(height: 16),
           ],
 
-          // ── Pending Request Queue Card ────────────────────────────────
-          _buildQueueCard(),
-          const SizedBox(height: 16),
+          // ── Request Log Header & List ─────────────────────────────────
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'REQUEST LOG',
+                style: GoogleFonts.inter(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.1,
+                  color: AppPalette.textSecondary(context),
+                ),
+              ),
+              if (_pendingQueue.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: AppPalette.accent.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '${_pendingQueue.length} WAITING',
+                    style: GoogleFonts.inter(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w800,
+                      color: AppPalette.accent,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
 
-          // ── Event Stream & Recovery Log ───────────────────────────────
-          _buildEventLogCard(),
-          const SizedBox(height: 16),
+          if (_allRequests.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 40),
+              child: Center(
+                child: Column(
+                  children: [
+                    Icon(
+                      Icons.cloud_upload_outlined,
+                      size: 48,
+                      color: AppPalette.textSecondary(context).withValues(alpha: 0.4),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'No requests yet',
+                      style: GoogleFonts.inter(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: AppPalette.textSecondary(context),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Tap "Send Request" below to test queuing and recovery',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        color: AppPalette.textSecondary(context).withValues(alpha: 0.8),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            ...List.generate(_allRequests.length, (i) {
+              final req = _allRequests[i];
+              return FadeSlideEntrance(
+                index: i,
+                child: _buildRequestTile(req),
+              );
+            }),
 
-          // ── Historical Request Log ────────────────────────────────────
-          _buildRequestHistory(),
-          const SizedBox(height: 32),
+          const SizedBox(height: 80), // Padding for FAB
         ],
       ),
+      floatingActionButton: _buildSendRequestFab(),
     );
   }
 
-  // ── UI Components ────────────────────────────────────────────────────────
+  // ── Widgets ──────────────────────────────────────────────────────────────
 
-  Widget _buildNetworkDashboardCard() {
-    final (label, icon, color, gradient) = switch (_currentNetwork) {
-      NetworkType.wifi => (
-          'Connected via Wi-Fi',
+  Widget _buildStatusBanner() {
+    final (label, icon, color, gradient) = switch (_netStatus) {
+      _NetStatus.wifi => (
+          'Wi-Fi Connected',
           Icons.wifi_rounded,
           AppPalette.primary,
           AppPalette.brandGradient,
         ),
-      NetworkType.cellular => (
-          'Connected via Cellular',
+      _NetStatus.cellular => (
+          'Cellular Connected',
           Icons.signal_cellular_alt_rounded,
-          const Color(0xFF3949AB),
+          const Color(0xFF00796B),
           const LinearGradient(
-            colors: [Color(0xFF3949AB), Color(0xFF1E88E5)],
+            colors: [Color(0xFF00796B), Color(0xFF004D40)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
         ),
-      NetworkType.ethernet => (
-          'Connected via Ethernet',
-          Icons.settings_ethernet_rounded,
-          AppPalette.primary,
-          AppPalette.brandGradient,
-        ),
-      NetworkType.offline => (
-          'Offline (No Network)',
+      _NetStatus.offline => (
+          'Offline',
           Icons.wifi_off_rounded,
           AppPalette.accent,
           LinearGradient(
-            colors: [AppPalette.accent, const Color(0xFFE53935)],
+            colors: [AppPalette.accent, const Color(0xFFD32F2F)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
@@ -551,153 +558,93 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
           ),
         ],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Row(
-            children: [
-              AnimatedBuilder(
-                animation: _pulseAnim,
-                builder: (context, child) {
-                  return Opacity(
-                    opacity: _currentNetwork == NetworkType.offline
-                        ? 1.0
-                        : _pulseAnim.value,
-                    child: child,
-                  );
-                },
-                child: Container(
-                  width: 46,
-                  height: 46,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.2),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: Colors.white, size: 26),
-                ),
+          AnimatedBuilder(
+            animation: _pulseAnim,
+            builder: (context, child) {
+              return Opacity(
+                opacity: _netStatus == _NetStatus.offline ? 1.0 : _pulseAnim.value,
+                child: child,
+              );
+            },
+            child: Container(
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
               ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'REAL-TIME INTERFACE',
-                      style: GoogleFonts.inter(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.2,
-                        color: Colors.white70,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      label,
-                      style: GoogleFonts.inter(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w800,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  _currentNetwork == NetworkType.offline ? 'HALTED' : 'STREAMING',
+              child: Icon(icon, color: Colors.white, size: 26),
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'NETWORK STATUS',
                   style: GoogleFonts.inter(
                     fontSize: 10,
-                    fontWeight: FontWeight.w800,
-                    color: Colors.white,
-                    letterSpacing: 0.8,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                    color: Colors.white70,
                   ),
                 ),
-              ),
-            ],
+                const SizedBox(height: 4),
+                Text(
+                  label,
+                  style: GoogleFonts.inter(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 14),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'Handover switches: $_handoverCount',
-                style: GoogleFonts.inter(
-                  fontSize: 12,
-                  color: Colors.white.withValues(alpha: 0.9),
-                  fontWeight: FontWeight.w600,
-                ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.2),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              _netStatus == _NetStatus.offline ? 'HALTED' : 'LIVE',
+              style: GoogleFonts.inter(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                color: Colors.white,
+                letterSpacing: 1.0,
               ),
-              Text(
-                _lastStateChange == null
-                    ? 'Listening...'
-                    : 'Last transition: ${_lastStateChange!.hour.toString().padLeft(2, '0')}:${_lastStateChange!.minute.toString().padLeft(2, '0')}:${_lastStateChange!.second.toString().padLeft(2, '0')}',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  color: Colors.white70,
-                ),
-              ),
-            ],
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildMetricsRow() {
-    return Row(
-      children: [
-        Expanded(
-          child: _metricCard(
-            title: 'QUEUED REQUESTS',
-            value: '${_requestQueue.length}',
-            subtitle: _requestQueue.isEmpty ? 'Queue clean' : 'Awaiting sync',
-            color: _requestQueue.isEmpty ? AppPalette.primary : AppPalette.accent,
-            icon: Icons.hourglass_bottom_rounded,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _metricCard(
-            title: 'RECORDS FETCHED',
-            value: '$_totalRecordsDownloaded',
-            subtitle: 'Cumulative records',
-            color: AppPalette.primary,
-            icon: Icons.dataset_rounded,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _metricCard({
-    required String title,
-    required String value,
-    required String subtitle,
-    required Color color,
+  Widget _buildInfoChip({
     required IconData icon,
+    required String label,
+    required String value,
+    bool highlight = false,
   }) {
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
-        color: AppPalette.surface(context),
+        color: highlight
+            ? AppPalette.accent.withValues(alpha: 0.12)
+            : AppPalette.primarySoft,
         borderRadius: BorderRadius.circular(16),
-        boxShadow: AppPalette.cardShadow(context),
       ),
       child: Row(
         children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(icon, color: color, size: 22),
+          Icon(
+            icon,
+            color: highlight ? AppPalette.accent : AppPalette.primary,
+            size: 20,
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -705,27 +652,20 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  title,
+                  label,
                   style: GoogleFonts.inter(
-                    fontSize: 9,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.8,
-                    color: AppPalette.textSecondary(context),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: highlight ? AppPalette.accent : AppPalette.primary,
+                    letterSpacing: 0.6,
                   ),
                 ),
                 Text(
                   value,
                   style: GoogleFonts.inter(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w800,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
                     color: AppPalette.textPrimary(context),
-                  ),
-                ),
-                Text(
-                  subtitle,
-                  style: GoogleFonts.inter(
-                    fontSize: 10,
-                    color: AppPalette.textSecondary(context),
                   ),
                 ),
               ],
@@ -736,135 +676,7 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
     );
   }
 
-  Widget _buildSimulationControls() {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: AppPalette.surface(context),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: AppPalette.cardShadow(context),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.tune_rounded, size: 16, color: AppPalette.primary),
-              const SizedBox(width: 6),
-              Text(
-                'TEST HANDOVER & DISCONNECTION',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.8,
-                  color: AppPalette.textSecondary(context),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _simulateWifi,
-                  icon: const Icon(Icons.wifi, size: 16),
-                  label: const Text('Wi-Fi'),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _simulateCellular,
-                  icon: const Icon(Icons.signal_cellular_alt, size: 16),
-                  label: const Text('Cellular'),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _simulateDrop,
-                  icon: const Icon(Icons.signal_wifi_off, size: 16, color: Colors.white),
-                  label: const Text('Drop', style: TextStyle(color: Colors.white)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppPalette.accent,
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildActionButtons() {
-    return Row(
-      children: [
-        Expanded(
-          child: ElevatedButton.icon(
-            onPressed: triggerLargeDatasetFetch,
-            icon: const Icon(Icons.cloud_download_rounded, size: 18, color: Colors.white),
-            label: Text(
-              'Fetch 5k Dataset',
-              style: GoogleFonts.inter(
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                color: Colors.white,
-              ),
-            ),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppPalette.primary,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: OutlinedButton.icon(
-            onPressed: triggerContinuousBatchSync,
-            icon: Icon(Icons.all_inclusive_rounded, size: 18, color: AppPalette.primary),
-            label: Text(
-              'Continuous Sync',
-              style: GoogleFonts.inter(
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                color: AppPalette.primary,
-              ),
-            ),
-            style: OutlinedButton.styleFrom(
-              side: BorderSide(color: AppPalette.primary, width: 1.5),
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildActiveFetchCard() {
+  Widget _buildActiveTransferCard(QueuedRequest req) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -889,19 +701,18 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  _activeTaskLabel,
+                  '${req.label} — In Flight',
                   style: GoogleFonts.inter(
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
                     color: AppPalette.textPrimary(context),
                   ),
-                  overflow: TextOverflow.ellipsis,
                 ),
               ),
               Text(
-                '${(_progressValue * 100).toInt()}%',
+                '${req.progressPercent}%',
                 style: GoogleFonts.inter(
-                  fontSize: 14,
+                  fontSize: 13,
                   fontWeight: FontWeight.w800,
                   color: AppPalette.primary,
                 ),
@@ -912,306 +723,150 @@ class _Activity2NetworkScreenState extends State<Activity2NetworkScreen>
           ClipRRect(
             borderRadius: BorderRadius.circular(6),
             child: LinearProgressIndicator(
-              value: _progressValue,
-              minHeight: 8,
+              value: req.progress,
+              minHeight: 6,
               backgroundColor: AppPalette.primarySoft,
               valueColor: const AlwaysStoppedAnimation<Color>(AppPalette.primary),
             ),
           ),
           const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                _streamedRecords > 0
-                    ? 'Records: $_streamedRecords (${(_streamedBytes / 1024).toStringAsFixed(1)} KB)'
-                    : 'Transferred: ${(_streamedBytes / 1024).toStringAsFixed(1)} KB',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  color: AppPalette.textSecondary(context),
-                ),
-              ),
-              Text(
-                'Interface: ${_netName(_currentNetwork)}',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: AppPalette.primary,
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildQueueCard() {
-    if (_requestQueue.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppPalette.accentSoft,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppPalette.accent.withValues(alpha: 0.3)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.queue_rounded, color: AppPalette.accent, size: 20),
-              const SizedBox(width: 8),
-              Text(
-                'PENDING REQUEST QUEUE (${_requestQueue.length})',
-                style: GoogleFonts.inter(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.8,
-                  color: AppPalette.accent,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
           Text(
-            'The requests below were caught during network drops/handovers. They are preserved in memory and will auto-resume immediately upon connection restoration.',
+            req.detail,
             style: GoogleFonts.inter(
-              fontSize: 12,
-              color: AppPalette.textPrimary(context).withValues(alpha: 0.8),
+              fontSize: 11,
+              color: AppPalette.textSecondary(context),
             ),
           ),
-          const SizedBox(height: 12),
-          ..._requestQueue.map((item) => Container(
-                margin: const EdgeInsets.only(bottom: 6),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.hourglass_top_rounded,
-                        size: 16, color: AppPalette.accent),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '${item.id}: ${item.title}',
-                        style: GoogleFonts.inter(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: AppPalette.textPrimary(context),
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    Text(
-                      item.failureReason ?? 'Queued',
-                      style: GoogleFonts.inter(
-                        fontSize: 10,
-                        color: AppPalette.accent,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ],
-                ),
-              )),
         ],
       ),
     );
   }
 
-  Widget _buildEventLogCard() {
+  Widget _buildRequestTile(QueuedRequest req) {
+    final (icon, color, badgeText) = switch (req.state) {
+      RequestState.running => (
+          Icons.sync_rounded,
+          AppPalette.primary,
+          'RUNNING',
+        ),
+      RequestState.queued => (
+          Icons.hourglass_top_rounded,
+          const Color(0xFFF57C00), // Amber
+          'QUEUED',
+        ),
+      RequestState.interrupted => (
+          Icons.pause_circle_outline_rounded,
+          AppPalette.accent,
+          'INTERRUPTED',
+        ),
+      RequestState.done => (
+          Icons.check_circle_rounded,
+          const Color(0xFF388E3C), // Green
+          'DONE',
+        ),
+    };
+
+    final timeString =
+        '${req.createdAt.hour.toString().padLeft(2, '0')}:${req.createdAt.minute.toString().padLeft(2, '0')}:${req.createdAt.second.toString().padLeft(2, '0')}';
+
     return Container(
-      padding: const EdgeInsets.all(16),
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
         color: AppPalette.surface(context),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(14),
         boxShadow: AppPalette.cardShadow(context),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'NETWORK EVENT & RECOVERY STREAM',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.8,
-                  color: AppPalette.textSecondary(context),
-                ),
-              ),
-              Text(
-                '${_eventLogs.length} events',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  color: AppPalette.textSecondary(context),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
           Container(
-            height: 140,
-            padding: const EdgeInsets.all(10),
+            width: 36,
+            height: 36,
             decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.03),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                color: AppPalette.textSecondary(context).withValues(alpha: 0.1),
+              color: color.withValues(alpha: 0.12),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, size: 18, color: color),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  req.label,
+                  style: GoogleFonts.inter(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: AppPalette.textPrimary(context),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '$timeString — ${req.detail}',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    color: AppPalette.textSecondary(context),
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              badgeText,
+              style: GoogleFonts.inter(
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                color: color,
+                letterSpacing: 0.6,
               ),
             ),
-            child: _eventLogs.isEmpty
-                ? Center(
-                    child: Text(
-                      'No events logged yet. Toggling Wi-Fi/Cellular triggers stream events.',
-                      style: GoogleFonts.inter(
-                        fontSize: 11,
-                        color: AppPalette.textSecondary(context),
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                  )
-                : ListView.builder(
-                    itemCount: _eventLogs.length,
-                    itemBuilder: (context, idx) {
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 2),
-                        child: Text(
-                          _eventLogs[idx],
-                          style: GoogleFonts.firaCode(
-                            fontSize: 11,
-                            color: AppPalette.textPrimary(context),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildRequestHistory() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'REQUEST LIFECYCLE HISTORY',
-          style: GoogleFonts.inter(
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.8,
-            color: AppPalette.textSecondary(context),
-          ),
+  Widget _buildSendRequestFab() {
+    return TapScale(
+      onTap: _triggerRequest,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF004D40), // Dark Teal matching screenshot
+          borderRadius: BorderRadius.circular(32),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF004D40).withValues(alpha: 0.4),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
         ),
-        const SizedBox(height: 8),
-        if (_historyLog.isEmpty)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 24),
-            child: Center(
-              child: Text(
-                'No requests triggered yet. Tap "Fetch 5k Dataset" above.',
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppPalette.textSecondary(context),
-                ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.send_rounded, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Text(
+              'Send Request',
+              style: GoogleFonts.inter(
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
               ),
             ),
-          )
-        else
-          ...List.generate(_historyLog.length, (i) {
-            final item = _historyLog[i];
-            final (icon, color, label) = switch (item.status) {
-              RequestStatus.queued => (
-                  Icons.hourglass_bottom_rounded,
-                  AppPalette.accent,
-                  'QUEUED',
-                ),
-              RequestStatus.running => (
-                  Icons.sync_rounded,
-                  AppPalette.primary,
-                  'STREAMING',
-                ),
-              RequestStatus.completed => (
-                  Icons.check_circle_rounded,
-                  const Color(0xFF388E3C),
-                  'COMPLETED',
-                ),
-              RequestStatus.failed => (
-                  Icons.error_outline_rounded,
-                  AppPalette.accent,
-                  'FAILED',
-                ),
-            };
-
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              child: Row(
-                children: [
-                  Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha: 0.12),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(icon, size: 18, color: color),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '${item.id}: ${item.title}',
-                          style: GoogleFonts.inter(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: AppPalette.textPrimary(context),
-                          ),
-                        ),
-                        Text(
-                          item.status == RequestStatus.completed
-                              ? '${item.recordsFetched} items received'
-                              : (item.failureReason ?? 'Pending retry'),
-                          style: GoogleFonts.inter(
-                            fontSize: 11,
-                            color: AppPalette.textSecondary(context),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      label,
-                      style: GoogleFonts.inter(
-                        fontSize: 9,
-                        fontWeight: FontWeight.w800,
-                        color: color,
-                        letterSpacing: 0.8,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }),
-      ],
+          ],
+        ),
+      ),
     );
   }
 }
