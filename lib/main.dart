@@ -1,10 +1,12 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'providers/theme_provider.dart';
 import 'providers/user_provider.dart';
 import 'providers/notes_provider.dart';
 import 'providers/checklist_provider.dart';
+import 'providers/network_health_provider.dart';
+import 'providers/mesh_chat_provider.dart';
 import 'screens/home_screen.dart';
 import 'theme/app_theme.dart';
 
@@ -18,6 +20,8 @@ void main() {
         ChangeNotifierProvider(create: (_) => UserProvider()),
         ChangeNotifierProvider(create: (_) => NotesProvider()),
         ChangeNotifierProvider(create: (_) => ChecklistProvider()),
+        ChangeNotifierProvider(create: (_) => NetworkHealthProvider()),
+        ChangeNotifierProvider(create: (_) => MeshChatProvider()),
       ],
       child: const LabHubApp(),
     ),

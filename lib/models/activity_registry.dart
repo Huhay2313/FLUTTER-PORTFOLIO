@@ -3,6 +3,8 @@ import '../theme/app_theme.dart';
 import '../screens/activity1_screen.dart';
 import '../screens/activity2_screen.dart';
 import '../screens/activity2_network_screen.dart';
+import '../screens/activity3_screen.dart';
+import '../screens/activity4_screen.dart';
 import 'activity_meta.dart';
 
 // Single registry file for all lab activities across the semester.
@@ -34,5 +36,23 @@ final List<ActivityMeta> labActivities = [
     color: AppPalette.primary,
     colorSoft: AppPalette.primarySoft,
     builder: (context) => const Activity2NetworkScreen(),
+  ),
+  ActivityMeta(
+    id: 'activity_3',
+    title: 'Activity 3',
+    subtitle: 'Network Diagnostics • Adaptive media & health tiers',
+    icon: Icons.speed_rounded,
+    color: AppPalette.accent,
+    colorSoft: AppPalette.accentSoft,
+    builder: (context) => const Activity3Screen(),
+  ),
+  ActivityMeta(
+    id: 'activity_4',
+    title: 'Activity 4',
+    subtitle: 'Local Mesh Chat • Serverless P2P via Nearby Connections',
+    icon: Icons.hub_rounded,
+    color: AppPalette.primary,
+    colorSoft: AppPalette.primarySoft,
+    builder: (context) => const Activity4Screen(),
   ),
 ];
