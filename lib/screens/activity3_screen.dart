@@ -284,9 +284,13 @@ class _MetricsGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = provider.latestSnapshot;
+    final avgLoadPing = s == null
+        ? null
+        : ((s.downloadPingMs + s.uploadPingMs) / 2).round();
 
     return Column(
       children: [
+        // Row 1: Baseline Idle Ping & Average Load Ping
         Row(
           children: [
             Expanded(
@@ -300,21 +304,45 @@ class _MetricsGrid extends StatelessWidget {
             const SizedBox(width: 10),
             Expanded(
               child: _MetricChip(
-                icon: Icons.download_rounded,
-                label: 'DOWNLOAD',
-                value: s == null ? '—' : '${s.downloadMbps} Mbps',
-                color: _speedColor(s?.downloadMbps),
+                icon: Icons.stacked_line_chart_rounded,
+                label: 'AVG LOAD PING',
+                value: avgLoadPing == null ? '—' : '$avgLoadPing ms',
+                color: _pingColor(avgLoadPing),
               ),
             ),
           ],
         ),
         const SizedBox(height: 10),
+        // Row 2: Download Bandwidth & Download Ping
+        Row(
+          children: [
+            Expanded(
+              child: _MetricChip(
+                icon: Icons.download_rounded,
+                label: 'DOWNLOAD SPEED',
+                value: s == null ? '—' : '${s.downloadMbps} Mbps',
+                color: _speedColor(s?.downloadMbps),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _MetricChip(
+                icon: Icons.downloading_rounded,
+                label: 'DOWNLOAD PING',
+                value: s == null ? '—' : '${s.downloadPingMs} ms',
+                color: _pingColor(s?.downloadPingMs),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        // Row 3: Upload Bandwidth & Upload Ping
         Row(
           children: [
             Expanded(
               child: _MetricChip(
                 icon: Icons.upload_rounded,
-                label: 'UPLOAD',
+                label: 'UPLOAD SPEED',
                 value: s == null ? '—' : '${s.uploadMbps} Mbps',
                 color: _speedColor(s?.uploadMbps),
               ),
@@ -1122,10 +1150,17 @@ class _HistoryTile extends StatelessWidget {
                   ),
                 ),
                 Text(
-                  '↓ ${snapshot.downloadMbps} Mbps  ↑ ${snapshot.uploadMbps} Mbps  Ping: ${snapshot.idlePingMs} ms',
+                  '↓ ${snapshot.downloadMbps} Mbps (${snapshot.downloadPingMs} ms)  •  ↑ ${snapshot.uploadMbps} Mbps (${snapshot.uploadPingMs} ms)',
                   style: GoogleFonts.inter(
                     fontSize: 11,
                     color: AppPalette.textSecondary(context),
+                  ),
+                ),
+                Text(
+                  'Idle: ${snapshot.idlePingMs} ms  •  Tier: ${snapshot.tierLabel}',
+                  style: GoogleFonts.inter(
+                    fontSize: 10,
+                    color: AppPalette.textSecondary(context).withValues(alpha: 0.8),
                   ),
                 ),
               ],
